@@ -1,13 +1,14 @@
 /**
- * update-docs.ts — Scan extension source code via TypeScript AST and regenerate
- * the root README.md with an accurate extension catalog.
+ * update-docs.ts — Scan extension source code via TypeScript AST and skill
+ * frontmatter, then regenerate the root README.md catalog.
  *
- * Supports three directory layouts:
- *   1. <name>.ts                          (bare file — not recommended)
- *   2. <name>/index.ts                    (simple plugin)
- *   3. <category>/<name>/index.ts         (grouped plugins)
+ * Discovery is MANIFEST-DRIVEN (matches what `pi install` actually loads):
+ *   - `pi.extensions` entries in root package.json → each entry is a plugin
+ *     directory (with index.ts) or a bare .ts file
+ *   - `pi.skills` entries → each directory containing SKILL.md (directly or
+ *     as a child) is a skill; name/description come from frontmatter
  *
- * Extracts from each extension's index.ts:
+ * Extracts from each extension's source (following relative imports):
  *   - pi.registerProvider()  → provider id, display name, model list
  *   - pi.registerCommand()   → command name, description
  *   - pi.registerTool()      → tool name, description
@@ -30,6 +31,13 @@ interface RepoConfig {
   description: string;
   repository: string;
   installUrl: string;
+}
+
+interface SkillInfo {
+  /** Relative path from repo root (e.g. "skills/pi-extension-dev") */
+  relPath: string;
+  name: string;
+  description: string;
 }
 
 interface ProviderInfo {
@@ -81,9 +89,13 @@ interface ExtensionInfo {
 
 // ── Repo Config ──────────────────────────────────────────────────────────────
 
-function readRepoConfig(repoRoot: string): RepoConfig {
+function readRootPackage(repoRoot: string): Record<string, any> {
   const pkgPath = path.join(repoRoot, "package.json");
-  const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+  return JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+}
+
+function readRepoConfig(repoRoot: string): RepoConfig {
+  const pkg = readRootPackage(repoRoot);
   return {
     name: pkg.name ?? "pi-extensions",
     description: pkg.description ?? "Collection of pi extensions",
@@ -442,50 +454,108 @@ function parseExtension(extDir: string): ExtensionInfo | undefined {
   return info;
 }
 
-// ── Extension Discovery ──────────────────────────────────────────────────────
-
-const SKIP_DIRS = new Set([".git", "node_modules", "scripts", ".github", ".pi"]);
+// ── Extension Discovery (manifest-driven) ────────────────────────────────────
 
 /**
- * Recursively find all directories containing index.ts (extension roots).
- * Supports layouts:
- *   - <name>/index.ts
- *   - <category>/<name>/index.ts
+ * Resolve extensions from the `pi.extensions` manifest in root package.json.
+ * This matches exactly what `pi install` loads — the README never advertises
+ * something users won't get. Entries may be plugin directories (with
+ * index.ts) or bare .ts files.
  */
 function findExtensions(repoRoot: string): { relPath: string; absPath: string }[] {
+  const pkg = readRootPackage(repoRoot);
+  const entries: string[] = Array.isArray(pkg.pi?.extensions) ? pkg.pi.extensions : [];
   const results: { relPath: string; absPath: string }[] = [];
 
-  function walk(dir: string, depth: number) {
-    if (depth > 2) return; // max depth: category/plugin
+  for (const entry of entries) {
+    const absPath = path.resolve(repoRoot, entry);
+    let relPath: string;
 
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
+    if (fs.existsSync(absPath) && fs.statSync(absPath).isFile()) {
+      // Bare .ts file entry
+      relPath = entry.replace(/\.ts$/, "");
+      results.push({ relPath, absPath });
+      continue;
     }
 
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      if (SKIP_DIRS.has(entry.name) || entry.name.startsWith(".")) continue;
+    const indexPath = path.join(absPath, "index.ts");
+    if (fs.existsSync(indexPath)) {
+      relPath = entry.replace(/\/$/, "");
+      results.push({ relPath, absPath });
+    } else {
+      console.warn(`  ⚠ pi.extensions entry not found (skipped): ${entry}`);
+    }
+  }
 
-      const childDir = path.join(dir, entry.name);
-      const indexPath = path.join(childDir, "index.ts");
+  return results.sort((a, b) => a.relPath.localeCompare(b.relPath));
+}
 
-      if (fs.existsSync(indexPath)) {
-        results.push({
-          relPath: path.relative(repoRoot, childDir),
-          absPath: childDir,
-        });
-      } else {
-        // Recurse deeper (for category/plugin layout)
-        walk(childDir, depth + 1);
+// ── Skill Discovery ──────────────────────────────────────────────────────────
+
+/** Parse YAML-ish frontmatter (name, description) from a SKILL.md file. */
+function parseSkillFrontmatter(
+  skillMdPath: string,
+): { name: string; description: string } | undefined {
+  const content = fs.readFileSync(skillMdPath, "utf-8");
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!match) return undefined;
+
+  const frontmatter = match[1];
+  const get = (key: string): string | undefined => {
+    const line = frontmatter
+      .split(/\r?\n/)
+      .find((l) => l.startsWith(`${key}:`));
+    if (!line) return undefined;
+    const value = line.slice(key.length + 1).trim();
+    return value.replace(/^["']|["']$/g, "") || undefined;
+  };
+
+  const name = get("name");
+  const description = get("description");
+  if (!name || !description) return undefined;
+
+  return { name, description };
+}
+
+/**
+ * Resolve skills from `pi.skills` entries in root package.json.
+ * Each entry is a directory; a skill is that directory itself (SKILL.md at
+ * its root) or any direct child directory containing SKILL.md.
+ */
+function findSkills(repoRoot: string): SkillInfo[] {
+  const pkg = readRootPackage(repoRoot);
+  const entries: string[] = Array.isArray(pkg.pi?.skills) ? pkg.pi.skills : [];
+  const results: SkillInfo[] = [];
+
+  for (const entry of entries) {
+    const baseDir = path.resolve(repoRoot, entry);
+    if (!fs.existsSync(baseDir)) {
+      console.warn(`  ⚠ pi.skills entry not found (skipped): ${entry}`);
+      continue;
+    }
+
+    // Skill at the entry root: <entry>/SKILL.md
+    const rootSkillMd = path.join(baseDir, "SKILL.md");
+    if (fs.existsSync(rootSkillMd)) {
+      const info = parseSkillFrontmatter(rootSkillMd);
+      if (info) {
+        results.push({ ...info, relPath: entry.replace(/\/$/, "") });
+        continue;
+      }
+    }
+    // Skills as child directories: <entry>/<name>/SKILL.md
+    for (const child of fs.readdirSync(baseDir, { withFileTypes: true })) {
+      if (!child.isDirectory() || child.name.startsWith(".")) continue;
+      const childSkillMd = path.join(baseDir, child.name, "SKILL.md");
+      if (!fs.existsSync(childSkillMd)) continue;
+      const info = parseSkillFrontmatter(childSkillMd);
+      if (info) {
+        results.push({ ...info, relPath: `${entry.replace(/\/$/, "")}/${child.name}` });
       }
     }
   }
 
-  walk(repoRoot, 0);
-  return results.sort((a, b) => a.relPath.localeCompare(b.relPath));
+  return results;
 }
 
 // ── README Generator ─────────────────────────────────────────────────────────
@@ -496,7 +566,11 @@ function formatContextWindow(n: number): string {
   return String(n);
 }
 
-function generateReadme(config: RepoConfig, extensions: ExtensionInfo[]): string {
+function generateReadme(
+  config: RepoConfig,
+  skills: SkillInfo[],
+  extensions: ExtensionInfo[],
+): string {
   const installUrl = config.installUrl;
   const lines: string[] = [];
 
@@ -505,26 +579,47 @@ function generateReadme(config: RepoConfig, extensions: ExtensionInfo[]): string
   lines.push(config.description);
   lines.push("");
   lines.push(
-    "> **Auto-generated**: The extension catalog below is generated by `scripts/update-docs.ts`.",
+    "> **Auto-generated**: The catalog below is generated by `scripts/update-docs.ts`.",
   );
   lines.push("> Edit the source files and re-run the script to update.");
   lines.push("");
-  lines.push("## Extensions");
-  lines.push("");
 
-  // Summary table
-  lines.push("| Extension | Providers | Commands | Tools |");
-  lines.push("|-----------|-----------|----------|-------|");
-  for (const ext of extensions) {
-    const providerNames = ext.providers.map((p) => `\`${p.id}\``).join(", ") || "—";
-    const commandNames =
-      ext.commands.map((c) => `\`/${c.name}\``).join(", ") || "—";
-    const toolNames = ext.tools.map((t) => `\`${t.name}\``).join(", ") || "—";
+  // Skills section
+  if (skills.length > 0) {
+    lines.push("## Skills");
+    lines.push("");
+    lines.push("| Skill | Description |");
+    lines.push("|-------|-------------|");
+    for (const skill of skills) {
+      lines.push(
+        `| [${skill.name}](${skill.relPath}/SKILL.md) | ${skill.description} |`,
+      );
+    }
+    lines.push("");
     lines.push(
-      `| [${ext.relPath}](./${ext.relPath}) | ${providerNames} | ${commandNames} | ${toolNames} |`,
+      `Load in pi with \`/skill:${skills[0].name}\` (or automatically when a task matches its description).`,
     );
+    lines.push("");
   }
-  lines.push("");
+
+  if (extensions.length > 0) {
+    lines.push("## Extensions");
+    lines.push("");
+
+    // Summary table
+    lines.push("| Extension | Providers | Commands | Tools |");
+    lines.push("|-----------|-----------|----------|-------|");
+    for (const ext of extensions) {
+      const providerNames = ext.providers.map((p) => `\`${p.id}\``).join(", ") || "—";
+      const commandNames =
+        ext.commands.map((c) => `\`/${c.name}\``).join(", ") || "—";
+      const toolNames = ext.tools.map((t) => `\`${t.name}\``).join(", ") || "—";
+      lines.push(
+        `| [${ext.relPath}](./${ext.relPath}) | ${providerNames} | ${commandNames} | ${toolNames} |`,
+      );
+    }
+    lines.push("");
+  }
 
   // Detailed sections
   for (const ext of extensions) {
@@ -660,6 +755,11 @@ function main() {
   const config = readRepoConfig(repoRoot);
   console.log(`  Repo: ${config.name}`);
 
+  const skills = findSkills(repoRoot);
+  for (const skill of skills) {
+    console.log(`  ✓ skill ${skill.name} (${skill.relPath})`);
+  }
+
   const extDirs = findExtensions(repoRoot);
   const extensions: ExtensionInfo[] = [];
 
@@ -674,15 +774,16 @@ function main() {
     }
   }
 
-  if (extensions.length === 0) {
-    console.error("No extensions found.");
+  if (extensions.length === 0 && skills.length === 0) {
+    console.error("No extensions or skills found (pi.extensions / pi.skills are empty).");
     process.exit(1);
   }
 
-  const generated = generateReadme(config, extensions);
+  const generated = generateReadme(config, skills, extensions);
 
   // Support preamble: if the existing README contains a <!-- AUTO --> marker,
   // preserve everything before it and append the generated catalog after.
+  // The marker itself is preserved so repeated runs stay idempotent.
   let finalReadme = generated;
   if (fs.existsSync(readmePath)) {
     const existing = fs.readFileSync(readmePath, "utf-8");
@@ -692,7 +793,7 @@ function main() {
       const preamble = existing.slice(0, idx).trimEnd();
       // Strip title + description block generated by generateReadme()
       const withoutTitle = generated.replace(/^# [^\n]+\n\n[^\n]+\n\n/, "");
-      finalReadme = preamble + "\n\n" + withoutTitle;
+      finalReadme = preamble + "\n\n" + marker + "\n" + withoutTitle;
     }
   }
 

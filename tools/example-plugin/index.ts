@@ -2,30 +2,33 @@
  * Example Plugin — Tool & Command Extension
  *
  * Demonstrates the complete patterns for registering custom tools and
- * slash commands in pi with proper TUI rendering and error handling.
+ * slash commands in pi:
  *
- * ## What this extension provides
- *
- * - Tool: `example_tool` — callable by the AI model (demonstrates structured
- *    result format, renderCall/renderResult, error handling)
- * - Command: `/example` — user-invokable slash command (demonstrates
- *    ctx.ui.notify, LLM fallback pattern)
+ * - Tool: `example_tool` — callable by the AI model
+ *     - typebox schema + StringEnum (Google API compatible)
+ *     - two-tier error signaling: throw for hard failures, structured
+ *       content with recovery clues for self-correctable failures
+ *     - promptSnippet for discoverability
+ *     - renderCall/renderResult TUI rendering
+ * - Command: `/example` — user-invokable (ctx.ui.notify, LLM fallback)
+ * - Command: `/example-test` — runtime self-check pattern
+ * - lib.ts separation: pure logic is imported, not inlined
  *
  * ## Testing
  *
  *   pi -e ./tools/example-plugin/index.ts
  *   /example hello world              # test command
+ *   /example-test                     # runtime self-check
  *   > Please call example_tool now    # test tool via agent
  *
- * ## Credits
- *
- * This template is based on patterns from pi-alarm and pi-github.
- * See https://github.com/Traveler0014/pi-alarm and
- * https://github.com/Traveler0014/pi-github for real-world examples.
+ * Design reference: skills/pi-extension-dev/ (or /skill:pi-extension-dev)
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
+import { loadConfig, processQuery, validateEmail } from "./lib.js";
 
 // =============================================================================
 // Helpers
@@ -52,17 +55,15 @@ function textResult(text: string, details?: Record<string, unknown>) {
 export default function (pi: ExtensionAPI) {
   // ── Tool: example_tool ──────────────────────────────────────────────────
   //
-  // Tools are callable by the AI model during conversations.
-  // The agent decides when to call based on the tool's description.
-  //
   // Key properties of a well-designed tool:
-  //   1. name: snake_case with prefix (e.g. "example_tool")
-  //   2. label: short human-readable label for TUI rendering
-  //   3. description: detailed — the agent reads this to decide WHEN to call
-  //   4. parameters: JSON Schema object describing accepted arguments
+  //   1. name: snake_case with prefix ("example_tool")
+  //   2. description: detailed — the agent reads this to decide WHEN to call
+  //   3. promptSnippet: one-line entry in the system prompt's "Available
+  //      tools" section. Without it the tool is hard to discover.
+  //   4. parameters: typebox schema. Use StringEnum for string enums —
+  //      Type.Union/Type.Literal are NOT compatible with Google's API.
   //   5. execute: returns { content: [...], details: {...} }
-  //   6. renderCall: how the tool invocation appears in the TUI conversation
-  //   7. renderResult: how the tool result appears in the TUI conversation
+  //   6. renderCall/renderResult: TUI rendering
 
   pi.registerTool({
     name: "example_tool",
@@ -70,68 +71,77 @@ export default function (pi: ExtensionAPI) {
 
     description:
       "An example tool demonstrating proper pi extension patterns. " +
-      "Replace this with your actual implementation. " +
-      "See pi-github and pi-alarm for production examples.",
+      "Processes a text query and returns the result. " +
+      "Replace this with your actual implementation.",
 
-    parameters: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description: "The input query to process",
-        },
-        format: {
-          type: "string",
-          enum: ["json", "text"],
-          description: "Output format for the result (default: text)",
-        },
-      },
-      required: ["query"],
-    },
+    promptSnippet: "Process a text query via example_tool(query, format?)",
+
+    parameters: Type.Object({
+      query: Type.String({
+        description: "The input text to process",
+      }),
+      format: Type.Optional(
+        StringEnum(["json", "text"] as const, {
+          description: "Output format (default: text)",
+        }),
+      ),
+    }),
 
     // ── execute() — the actual tool logic ───────────────────────────────
     //
-    // Parameters:
-    //   _toolCallId   — unique ID for this invocation (use for logging/tracing)
-    //   params        — the validated argument object (typed per your schema)
+    // ERROR SIGNALING — two tiers, use the right one:
     //
-    // Return value MUST be:
-    //   { content: [{ type: "text", text: "..." }], details: { ... } }
+    //   throw          → hard failure. pi marks isError: true and reports
+    //                    the error to the model. Use for invalid input and
+    //                    unrecoverable failures.
     //
-    // Do NOT return plain strings or bare objects.
+    //   return content → soft failure WITH RECOVERY CLUES. The model reads
+    //                    the text and self-corrects (e.g. retries with a
+    //                    different selector). Never encode hard errors as
+    //                    plain returns — returning never sets isError.
 
     async execute(_toolCallId, params) {
-      // 1. Validate inputs — agent-facing tools should be strict
+      // 1. Hard failure → throw (invalid input is never self-correctable
+      //    by retrying with the same arguments)
       if (!params.query || params.query.trim().length === 0) {
-        return textResult(
-          `Error: 'query' must be a non-empty string. Received: "${params.query}"`,
-          { error: "invalid query" },
+        throw new Error(
+          `Invalid 'query': must be a non-empty string (received "${params.query}")`,
         );
       }
 
-      // 2. Execute your actual business logic
-      const response = processQuery(params.query, params.format);
+      // 2. Business logic lives in lib.ts (pure, unit-tested, no pi imports)
+      const { result, timestamp } = processQuery(params.query);
 
-      // 3. Return structured result with details for TUI rendering
+      // 3. Soft-failure example: structured return with recovery clues.
+      //    Here "email:" prefix triggers validation — if it fails we tell
+      //    the model exactly what went wrong and how to fix it.
+      if (params.query.startsWith("email:")) {
+        const email = params.query.slice("email:".length).trim();
+        const error = validateEmail(email);
+        if (error) {
+          return textResult(
+            `${error}. Retry with a valid address, e.g. "email:user@example.com".`,
+            { validation: "failed", hint: "email:<address> prefix" },
+          );
+        }
+      }
+
+      // 4. Success → structured result with details for TUI rendering
+      if (params.format === "json") {
+        return textResult(
+          JSON.stringify({ query: params.query, result, timestamp }, null, 2),
+          { format: "json", queryLength: params.query.length },
+        );
+      }
       return textResult(
-        response.text,
-        {
-          formatted: response.formatted,
-          format: params.format || "text",
-          queryLength: params.query.length,
-        },
+        `Processed: ${params.query} → ${result} (length=${result.length})`,
+        { format: "text", queryLength: params.query.length },
       );
     },
 
     // ── renderCall() — how the tool invocation looks in the TUI ────────
     //
-    // This renders BEFORE the tool executes (shows what's about to happen).
-    // Use colors from theme to match pi's visual style:
-    //   theme.fg("toolTitle", ...) for the tool name
-    //   theme.fg("accent", ...)   for repo names, IDs, etc.
-    //   theme.fg("muted", ...)    for secondary info
-    //   theme.fg("text", ...)     for primary content
-    //   theme.fg("dim", ...)      for tertiary/placeholder text
+    // Renders BEFORE the tool executes (shows what is about to happen).
 
     renderCall(args, theme, _context) {
       let text = theme.fg("toolTitle", theme.bold("example_tool"));
@@ -144,22 +154,14 @@ export default function (pi: ExtensionAPI) {
 
     // ── renderResult() — how the tool result appears in the TUI ─────────
     //
-    // This renders AFTER the tool executes (shows the outcome).
-    // Access result.content[0].text for the plain text output.
-    // Access result.details for the structured metadata.
-    //
-    // Common patterns:
-    //   theme.fg("success", ...) for successful results
-    //   theme.fg("error", ...)   for error results
-    //   theme.fg("muted", ...)   for compact summary views
+    // Renders AFTER execution. Read result.details for structured state.
 
     renderResult(result, _options, theme, _context) {
       const content = result.content[0];
       const details = result.details as Record<string, unknown> | undefined;
 
-      if (details?.error) {
-        // Error state — show compact error in red
-        return new Text(theme.fg("error", "Failed"), 0, 0);
+      if (details?.validation === "failed") {
+        return new Text(theme.fg("warning", "Recovered"), 0, 0);
       }
 
       if (content?.type === "text") {
@@ -173,21 +175,14 @@ export default function (pi: ExtensionAPI) {
 
   // ── Command: /example ───────────────────────────────────────────────────
   //
-  // For interactive wizard patterns (select/input/confirm), see:
-  //   docs/interactive-commands.md
-  //   pi-github /gh-login (full 6-step wizard)
-  //
   // Commands are user-invokable via /command-name in the pi TUI.
-  //
   // Key differences from tools:
-  //   - Commands use kebab-case (/example-command)
-  //   - Use ctx.ui.notify() for user feedback (NOT return values)
-  //   - Can use ctx.ui.select() / ctx.ui.input() / ctx.ui.confirm() for
-  //     interactive prompts
-  //   - Parse loosely, fall back to LLM if parsing fails
+  //   - kebab-case names, loose parsing (humans type natural language)
+  //   - feedback via ctx.ui.notify() (NOT return values)
+  //   - LLM fallback when parsing fails — never a dead-end error
 
   pi.registerCommand("example", {
-    description: "An example command demonstrating proper patterns — /example <text>",
+    description: "An example command — /example <text>",
 
     async handler(args, ctx) {
       const input = args.trim();
@@ -210,10 +205,6 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── LLM fallback for unhandled input ───────────────────────────
-      //
-      // When the command parser doesn't understand the input, forward
-      // it to the AI agent via pi.sendUserMessage(). This is the
-      // RECOMMENDED pattern — never just show an error and quit.
       if (ctx.isIdle()) {
         pi.sendUserMessage(
           `User invoked /example with: "${input}". ` +
@@ -224,63 +215,65 @@ export default function (pi: ExtensionAPI) {
       }
     },
   });
+
+  // ── Command: /example-test ──────────────────────────────────────────────
+  //
+  // Runtime self-check pattern — REQUIRED for plugins with environment
+  // dependencies (binaries, endpoints, auth). Each failed check tells
+  // the user how to FIX it, not just that it broke.
+  // Pure-logic plugins can skip this (vitest covers them).
+
+  pi.registerCommand("example-test", {
+    description: "Runtime self-check: lib functions, config read/write",
+    handler: async (_args, ctx) => {
+      const checks: { name: string; run: () => string | Error }[] = [
+        {
+          name: "lib.processQuery",
+          run: () => {
+            const { result } = processQuery("  ok  ");
+            return result === "ok" ? "round-trip ok" : new Error("unexpected result");
+          },
+        },
+        {
+          name: "lib.validateEmail",
+          run: () => {
+            const bad = validateEmail("not-an-email");
+            return bad === null
+              ? new Error("accepted an invalid email")
+              : "rejects invalid input";
+          },
+        },
+        {
+          name: "config readable",
+          run: () => {
+            const config = loadConfig();
+            return config.endpoint
+              ? `endpoint: ${config.endpoint}`
+              : new Error("no endpoint configured");
+          },
+        },
+      ];
+
+      let failed = 0;
+      for (const check of checks) {
+        const r = (() => {
+          try {
+            return check.run();
+          } catch (e) {
+            return e instanceof Error ? e : new Error(String(e));
+          }
+        })();
+        const ok = !(r instanceof Error);
+        if (!ok) failed++;
+        ctx.ui.notify(
+          `${ok ? "✓" : "✗"} ${check.name}: ${ok ? r : r.message}`,
+          ok ? "info" : "error",
+        );
+      }
+      ctx.ui.notify(
+        failed === 0 ? "example-plugin: all checks passed" : `${failed} check(s) failed`,
+        failed === 0 ? "info" : "warning",
+      );
+    },
+  });
 }
-
-// =============================================================================
-// Business Logic (your actual implementation goes here)
-// =============================================================================
-
-function processQuery(
-  query: string,
-  format?: string,
-): { text: string; formatted: unknown } {
-  const result = {
-    query,
-    processed: query.toUpperCase(),
-    length: query.length,
-    timestamp: new Date().toISOString(),
-  };
-
-  const formatted = format === "json" ? result : null;
-
-  return {
-    text: format === "json"
-      ? JSON.stringify(result, null, 2)
-      : `Processed: ${query} → ${result.processed} (length=${result.length})`,
-    formatted,
-  };
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Interactive command pattern (see docs/interactive-commands.md)
-// ═══════════════════════════════════════════════════════════════
-//
-// Use this pattern for commands that manage entities (add/remove/edit).
-// Key UX principles:
-//   1. Visible defaults in prompt text
-//   2. Example placeholders for required fields
-//   3. Purpose hints explaining what each field controls
-//   4. Structured summary showing all saved fields
-//   5. Detail + confirm before destructive actions
-//
-// Example:
-//
-// pi.registerCommand("example-add", {
-//   handler: async (args, ctx) => {
-//     // Quick mode
-//     if (args.trim()) { ctx.ui.notify("Quick: " + args); return; }
-//
-//     // Interactive wizard
-//     const namePrompt = "Item name\n  Default: example-1";
-//     const nameInput = await ctx.ui.input(namePrompt, "example-1");
-//     if (nameInput === undefined) return;
-//     const name = nameInput.trim() || "example-1";
-//
-//     // Structured summary
-//     ctx.ui.notify(`Added: ${name}`, "info");
-//   },
-// });
-//
-// Reference implementations:
-//   pi-github: /gh-login (6-step wizard with platform/url/token/scope)
-//   pi-alarm:  /alarm-cancel (interactive selection from pending list)

@@ -1,26 +1,32 @@
 {
-  "name": "pi-extension-template",
-  "version": "1.0.0",
-  "description": "Template repository for pi extensions — pick a layout and start building",
+  "name": "pi-extension-dev",
+  "version": "2.0.0",
+  "description": "pi extension development kit — install for the extension-dev skill, fork for the template scaffold",
   "keywords": [
-    "pi-package"
+    "pi-package",
+    "pi-skill"
   ],
   "author": "",
   "license": "MIT",
-  "repository": "git@github.com:Traveler0014/pi-extension-template.git",
-  "installUrl": "https://github.com/Traveler0014/pi-extension-template.git",
+  "type": "module",
+  "repository": "git@github.com:Traveler0014/pi-extension-dev.git",
+  "installUrl": "https://github.com/Traveler0014/pi-extension-dev.git",
   "scripts": {
     "update-docs": "tsx scripts/update-docs.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
   },
   "pi": {
-    "extensions": [
-      "example-provider",
-      "tools/example-plugin"
-    ]
+    "extensions": [],
+    "skills": ["./skills"]
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "^0.84.0",
+    "@earendil-works/pi-tui": "*",
+    "@types/node": "^24.0.0",
     "tsx": "^4.22.4",
+    "typebox": "*",
     "typescript": "^6.0.3",
     "vitest": "^4.1.9"
   }

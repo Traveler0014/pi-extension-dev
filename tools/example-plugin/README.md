@@ -1,9 +1,10 @@
 # example-plugin
 
-Example tool and command extension for pi — demonstrates the complete patterns for registering custom tools and slash commands with proper TUI rendering.
+Example tool and command extension for pi — demonstrates the complete patterns for registering custom tools and slash commands with proper TUI rendering and two-tier error signaling.
 
-> **This is a template.** Replace the placeholder logic with your actual implementation.  
+> **This is a template.** Replace the placeholder logic with your actual implementation.
 > See [pi-alarm](https://github.com/Traveler0014/pi-alarm) and [pi-github](https://github.com/Traveler0014/pi-github) for production examples.
+> Design reference: [skills/pi-extension-dev](../../skills/pi-extension-dev/) (or `/skill:pi-extension-dev`)
 
 ## Naming convention
 
@@ -12,14 +13,12 @@ Example tool and command extension for pi — demonstrates the complete patterns
 | Tool (agent) | `snake_case` | `<prefix>_<verb>` | `example_tool`, `gh_issue_create`, `alarm_set` |
 | Command (user) | `kebab-case` | `/<prefix>-<verb>` | `/example`, `/gh-login`, `/alarm-list` |
 
-- **prefix**: identifies the source extension
-- **verb**: a single action word (`set`, `list`, `cancel`, `create`, `delete`)
-- **exception**: non-verb getters with self-explanatory names (e.g. `alarm_now`)
-
 ## Features
 
-- **Tool:** `example_tool` — AI-callable tool with structured result format, TUI rendering, and error handling
+- **Tool:** `example_tool` — AI-callable tool with typebox schema, `StringEnum`, `promptSnippet`, structured results, TUI rendering
 - **Command:** `/example` — user-invokable slash command with `ctx.ui.notify()` and LLM fallback
+- **Command:** `/example-test` — runtime self-check pattern (for plugins with environment dependencies)
+- **lib.ts separation** — pure logic in `lib.ts`, unit-tested in `lib.test.ts`, zero pi imports
 
 ## Tools (agent-facing, snake_case)
 
@@ -29,19 +28,34 @@ An example tool demonstrating proper pi extension patterns.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `query` | string | ✅ | The input query to process |
-| `format` | string ("json", "text") | ❌ | Output format (default: text) |
+| `query` | string | ✅ | The input text to process |
+| `format` | "json" \| "text" | ❌ | Output format (default: text) |
 
-**Tool result format** — always return this shape:
+Schema uses typebox + `StringEnum` (Google API compatible):
 
 ```typescript
-{
-  content: [{ type: "text", text: "..." }],
-  details: { /* optional metadata for TUI rendering */ }
-}
+parameters: Type.Object({
+  query: Type.String({ description: "The input text to process" }),
+  format: Type.Optional(StringEnum(["json", "text"] as const)),
+}),
 ```
 
-Never return a plain string from `execute()` — pi requires structured output.
+**Error signaling — two tiers:**
+
+```typescript
+// Hard failure (invalid input, unrecoverable) → throw.
+// pi marks isError: true and reports it to the model.
+if (!params.query?.trim()) {
+  throw new Error(`Invalid 'query': must be a non-empty string`);
+}
+
+// Self-correctable failure → structured return WITH recovery clues.
+// The model reads the hint and retries with fixed arguments.
+return textResult(
+  `${error}. Retry with a valid address, e.g. "email:user@example.com".`,
+  { validation: "failed" },
+);
+```
 
 ## Commands (user-facing, kebab-case)
 
@@ -54,7 +68,9 @@ Interactive slash command with sub-commands and LLM fallback.
 /example process this text     # Falls back to LLM if parser doesn't understand
 ```
 
-When the command parser doesn't understand the input, use `pi.sendUserMessage()` to forward it to the AI agent — never just show an error.
+### `/example-test`
+
+Runtime self-check: runs lib round-trips and config readability, reports pass/fail per check. Adapt this pattern when your plugin depends on binaries, endpoints, or auth — each failed check should tell the user how to fix it.
 
 ## Key Patterns Demonstrated
 
@@ -62,23 +78,16 @@ When the command parser doesn't understand the input, use `pi.sendUserMessage()`
 
 ```typescript
 function textResult(text: string, details?: Record<string, unknown>) {
-  return {
-    content: [{ type: "text" as const, text }],
-    details: details ?? {},
-  };
+  return { content: [{ type: "text" as const, text }], details: details ?? {} };
 }
 ```
 
-### 2. renderCall / renderResult for TUI
+### 2. promptSnippet for discoverability
 
 ```typescript
-renderCall(args, theme, _context) {
-  return new Text(theme.fg("toolTitle", theme.bold("example_tool")), 0, 0);
-},
-
-renderResult(result, _options, theme, _context) {
-  return new Text(theme.fg("success", "Done"), 0, 0);
-},
+promptSnippet: "Process a text query via example_tool(query, format?)",
+// Without promptSnippet the tool does not appear in the system prompt's
+// "Available tools" section and is hard for the model to discover.
 ```
 
 ### 3. LLM fallback for commands
@@ -93,20 +102,14 @@ if (ctx.isIdle()) {
 
 ## Customization Checklist
 
-- [ ] Replace tool `name`, `label`, and `description`
-- [ ] Define tool `parameters` schema (JSON Schema)
-- [ ] Implement tool `execute()` returning structured result
-- [ ] Implement `renderCall()` and `renderResult()` with theme colors
+- [ ] Replace tool `name`, `label`, `description`, `promptSnippet`
+- [ ] Define tool `parameters` schema (typebox + StringEnum)
+- [ ] Implement `execute()` — throw on hard failures, recovery clues on soft ones
+- [ ] Implement `renderCall()` / `renderResult()` with theme colors
 - [ ] Replace command `name` and `description`
-- [ ] Implement command `handler()` with `ctx.ui.notify()`
-- [ ] Add LLM fallback for unparseable command input
+- [ ] Implement command `handler()` with `ctx.ui.notify()` + LLM fallback
+- [ ] Move business logic to `lib.ts`, add `lib.test.ts`
 - [ ] Update this README
-
-## Install
-
-```bash
-pi install https://github.com/Traveler0014/pi-extension-template.git
-```
 
 ## License
 
